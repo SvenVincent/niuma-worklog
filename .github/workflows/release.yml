@@ -1,0 +1,650 @@
+# 打 tag → 构建全平台 → 发布（**公开仓：这里跑 CI、这里出 Release**）
+#
+# 源码不在这里 —— 它在私有仓 SvenVincent/niuma。这个 workflow 用只读 deploy key
+# （secret 名 SRC_DEPLOY_KEY）把源码拉到工作区，之后的构建、打包、发布照旧。
+# 公开仓能看到：workflow、Release（安装包）、构建日志；看不到：任何一行产品源码。
+#
+# 发版：把 tag 推到**这个仓**
+#   git tag -a v1.1.7 -m v1.1.7 && git push origin v1.1.7
+# 手动重发某个版本：Actions → Release → Run workflow → source_ref 填那个 tag。
+# 打 tag → 构建全平台 → 发布
+#
+#   Web      dist 产物（可选自动部署到 Cloudflare Worker，即线上站点）
+#   桌面     macOS（arm64 / x64 dmg）、Windows（nsis exe）、Linux（AppImage + deb）—— Tauri 打包
+#   安卓     APK + AAB（**需先在本机跑一次 `npx tauri android init` 并提交 src-tauri/gen/android**）
+#
+# 发布 = 改版本号 → 提交 → 打 tag → 推上去：
+#   git tag -a v1.1.0 -m v1.1.0 && git push origin v1.1.0
+#
+# 为什么版本号不靠手敲：tag 只是 git 的事，构建工具不知道你打了什么 tag。
+# 所以有独立的 version job：手动输入 → tag → 配置文件，写进 $GITHUB_ENV，
+# 再由 inject-version.sh 写入 tauri.conf.json（决定产物文件名，实测 niuma_0.1.0_aarch64.dmg）与 package.json。
+#
+# 需要的仓库设置（Secrets / Variables 都在 Settings 里配）：
+#   Secrets  （可选）CF_R2_ACCOUNT_ID / CF_R2_ACCESS_KEY_ID / CF_R2_SECRET_ACCESS_KEY
+#                    CF_R2_BUCKET_NAME / CF_R2_ENDPOINT  → 让 CI 把安装包传到 R2，官网 /download 自动更新
+#   Secrets  （可选）CLOUDFLARE_API_TOKEN / CLOUDFLARE_ACCOUNT_ID → 让 CI 部署网页版
+#   Variables（可选）PUBLISH_R2 = true  → 打开上面那条 R2 上传
+#   Variables（可选）DEPLOY_WEB = true  → 打开上面那条网页版部署
+# 不配这些也不会红：对应的 job 会被跳过，其余平台照常构建并发布 GitHub Release。
+
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: "构建哪个源码版本（tag 或分支；留空则用当前分支）"
+        required: false
+        default: ""
+      build_version:
+        description: "版本号（留空则用 tag；都不是时用 package.json 里的）"
+        required: false
+        default: ""
+      build_number:
+        description: "构建号（留空则用 GitHub run number）"
+        required: false
+        default: ""
+  push:
+    tags:
+      - "v*"
+
+# 建 Release 需要写权限（新仓库的 GITHUB_TOKEN 默认只读，缺这行 403）
+permissions:
+  contents: write
+
+# 同一版本连点两次不并行；cancel-in-progress 必须 false —— 别把发到一半的 Release 掐了
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  NODE_VERSION: "20"
+
+jobs:
+  # ---------------------------------------------------------------- 版本号
+  version:
+    name: Resolve version
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      version: ${{ steps.resolve.outputs.version }}
+      number: ${{ steps.resolve.outputs.number }}
+    steps:
+      # 源码在**私有仓** SvenVincent/niuma，这里用只读 deploy key 拉下来，落进工作区根目录 ——
+      # 所以后面所有相对路径（npm ci、.github/scripts/…、src-tauri/）一个字都不用改。
+      - uses: actions/checkout@v4
+        with:
+          repository: SvenVincent/niuma
+          ref: ${{ inputs.source_ref || github.ref_name }}
+          ssh-key: ${{ secrets.SRC_DEPLOY_KEY }}
+          fetch-depth: 0
+
+      # 版本解析是"会静默毁掉每一次发布"的那一环，先自检 12 种触发场景
+      - name: Self-test version resolver
+        run: bash .github/scripts/resolve-version.sh --self-test
+
+      - name: Resolve build version
+        id: resolve
+        env:
+          INPUT_VERSION: ${{ inputs.build_version }}
+          INPUT_NUMBER: ${{ inputs.build_number }}
+          VERSION_FILE: package.json
+        run: |
+          set -euo pipefail
+          bash .github/scripts/resolve-version.sh
+          # 脚本把值写进 $GITHUB_ENV（供**后续 step** 用）和 $GITHUB_OUTPUT（供跨 job 用）。
+          # 同一个 step 里 $BUILD_VERSION 还读不到 —— GITHUB_ENV 不回溯生效，配合 set -u 会
+          # 直接 unbound variable 把这个 job 打死（首次发版就这样崩过一次），所以这里从 OUTPUT 读回。
+          version="$(grep -m1 '^version=' "$GITHUB_OUTPUT" | cut -d= -f2-)"
+          number="$(grep -m1 '^number=' "$GITHUB_OUTPUT" | cut -d= -f2-)"
+          # 空版本号会让所有产物带着旧版本发出去，这里必须拦住
+          [ -n "$version" ] || { echo "::error::没解析到版本号，停下"; exit 1; }
+          echo "本次发布版本：${version}（构建号 ${number}）"
+
+  # ---------------------------------------------------------------- 网页版产物
+  web:
+    name: Web bundle
+    needs: version
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      # 源码在**私有仓** SvenVincent/niuma，这里用只读 deploy key 拉下来，落进工作区根目录 ——
+      # 所以后面所有相对路径（npm ci、.github/scripts/…、src-tauri/）一个字都不用改。
+      - uses: actions/checkout@v4
+        with:
+          repository: SvenVincent/niuma
+          ref: ${{ inputs.source_ref || github.ref_name }}
+          ssh-key: ${{ secrets.SRC_DEPLOY_KEY }}
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+      - run: npm ci
+      - name: Inject version
+        run: bash .github/scripts/inject-version.sh "${{ needs.version.outputs.version }}"
+      - run: npm run build
+      - name: Package dist
+        run: |
+          set -euo pipefail
+          cd dist && zip -qr "../niuma-web-${{ needs.version.outputs.version }}.zip" .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: web-${{ needs.version.outputs.version }}
+          path: niuma-web-${{ needs.version.outputs.version }}.zip
+          if-no-files-found: error
+          overwrite: false
+
+  # ---------------------------------------------------------------- 桌面三平台
+  desktop:
+    name: Desktop ${{ matrix.label }}
+    needs: version
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      # 一个平台挂了，其余照常出包（但注意：矩阵里有任何一条腿卡住，后面的 release job 就得等它）
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14 # Apple Silicon，本机原生构建
+            label: macOS arm64
+            bundles: dmg
+            target: ""
+            artifact: macos-arm64
+          # Intel 包在 arm64 runner 上交叉编译：macos-13 正在被 GitHub 退役，
+          # 实测首发时那条腿排队十几分钟都拿不到机器（其余三端早就构建完了）。
+          - os: macos-14
+            label: macOS x64
+            bundles: dmg
+            target: x86_64-apple-darwin
+            artifact: macos-x64
+          - os: ubuntu-22.04 # webkit2gtk-4.1 在 22.04 上最稳
+            label: Linux x64
+            bundles: appimage,deb
+            target: ""
+            artifact: linux-x64
+          - os: windows-latest
+            label: Windows x64
+            bundles: nsis
+            target: ""
+            artifact: windows-x64
+    steps:
+      # 源码在**私有仓** SvenVincent/niuma，这里用只读 deploy key 拉下来，落进工作区根目录 ——
+      # 所以后面所有相对路径（npm ci、.github/scripts/…、src-tauri/）一个字都不用改。
+      - uses: actions/checkout@v4
+        with:
+          repository: SvenVincent/niuma
+          ref: ${{ inputs.source_ref || github.ref_name }}
+          ssh-key: ${{ secrets.SRC_DEPLOY_KEY }}
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      # 交叉编译要显式加目标三元组（macOS arm64 runner 上出 Intel 包）
+      - name: Add cross target
+        if: matrix.target != ''
+        run: rustup target add ${{ matrix.target }}
+
+      # 缓存 ~/.cargo 与 src-tauri/target：第二次跑省一大截（Tauri 全量编译第一次要十几分钟）
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      # Linux 桌面打包要额外系统包（这是"从零写最容易踩"的那个坑）
+      - name: Install Linux desktop deps
+        if: matrix.os == 'ubuntu-22.04'
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev build-essential curl wget file \
+            libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev patchelf
+      - run: npm ci
+
+      - name: Inject version
+        shell: bash
+        run: bash .github/scripts/inject-version.sh "${{ needs.version.outputs.version }}"
+
+      # tauri build 会先跑 beforeBuildCommand（npm run build）生成 dist，所以这里不用单独构建前端
+      - name: Build bundles
+        shell: bash
+        run: |
+          set -euo pipefail
+          # 交叉编译时才带 --target；没有该值时展开为空，不影响原生构建
+          target_arg=""
+          if [ -n "${{ matrix.target }}" ]; then target_arg="--target ${{ matrix.target }}"; fi
+          # 故意不加引号：这里就是要按空格拆成两个参数（空串则一个都不传）
+          # shellcheck disable=SC2086
+          npx tauri build --bundles ${{ matrix.bundles }} ${target_arg}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: desktop-${{ matrix.artifact }}-${{ needs.version.outputs.version }}
+          # 产物目录有两种：原生构建在 target/release/bundle，交叉编译在 target/<三元组>/release/bundle。
+          # 用一份 glob 列表把两种都覆盖，至少命中一个才不报错。
+          path: |
+            src-tauri/target/release/bundle/dmg/*.dmg
+            src-tauri/target/release/bundle/appimage/*.AppImage
+            src-tauri/target/release/bundle/deb/*.deb
+            src-tauri/target/release/bundle/nsis/*.exe
+            src-tauri/target/*/release/bundle/dmg/*.dmg
+            src-tauri/target/*/release/bundle/appimage/*.AppImage
+            src-tauri/target/*/release/bundle/deb/*.deb
+            src-tauri/target/*/release/bundle/nsis/*.exe
+          if-no-files-found: error
+          overwrite: false
+
+  # ---------------------------------------------------------------- 安卓（APK/AAB）
+  #
+  # 仓库里没有 src-tauri/gen/android 时会在 runner 上现场 `tauri android init --ci` 生成（不报错、不跳过）。
+  # NDK 直接用 runner 镜像自带的那个（实测 29.x）—— 不用 sdkmanager 装：
+  # 往 /usr/local/lib/android 写需要 sudo，装已经存在的版本同样会失败，还要白下 ~1GB。
+  android:
+    name: Android APK/AAB
+    needs: version
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      # 源码在**私有仓** SvenVincent/niuma，这里用只读 deploy key 拉下来，落进工作区根目录 ——
+      # 所以后面所有相对路径（npm ci、.github/scripts/…、src-tauri/）一个字都不用改。
+      - uses: actions/checkout@v4
+        with:
+          repository: SvenVincent/niuma
+          ref: ${{ inputs.source_ref || github.ref_name }}
+          ssh-key: ${{ secrets.SRC_DEPLOY_KEY }}
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      # 这里**不用** android-actions/setup-android：它启动时会跑 `sdkmanager tools`，
+      # 而 Google 已把旧的 tools 包从仓库移除 → 必然 "Failed to find package 'tools'" 挂掉。
+      # ubuntu-latest 镜像本来就自带 Android SDK（/usr/local/lib/android/sdk，含 cmdline-tools）
+      # 并设好了 ANDROID_HOME/ANDROID_SDK_ROOT，所以直接用镜像里的 sdkmanager 装 NDK 即可。
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,armv7-linux-androideabi,i686-linux-android,x86_64-linux-android
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+          key: android
+
+      - run: npm ci
+
+      - name: Inject version
+        run: bash .github/scripts/inject-version.sh "${{ needs.version.outputs.version }}"
+
+      # 移动端工程（src-tauri/gen/android）是 `tauri android init` 生成的：仓库里没有就现场生成。
+      # 为什么先 init 再装 NDK：gradle 工程里写着它要哪个 NDK 版本，读完再装能避免瞎猜
+      # （Google 的 SDK 仓库里老版本 NDK 会下架：实测 26.x/27.x 已装不到，只剩 28.x 起）。
+      - name: Init android target if missing
+        run: |
+          set -euo pipefail
+          if [ -d src-tauri/gen/android ]; then
+            echo "已存在 src-tauri/gen/android，跳过 init"
+          else
+            echo "::notice title=现场生成安卓工程::仓库里没有 src-tauri/gen/android，用 tauri android init --ci 生成（本机生成后提交可版本化并自定义签名）"
+            npx tauri android init --ci
+          fi
+          # 顺手把 gradle 对 NDK 的要求打进日志，便于出问题时对照
+          grep -rhn "ndkVersion" src-tauri/gen/android --include="*.kts" --include="*.gradle" || echo "（工程里没写 ndkVersion）"
+
+      # 统一图标：gen/android 是现场生成的，init 给的是 Tauri 模板默认图标。
+      # ① tauri icon 从 1024 母版重新生成全套（gen/android 存在时会写进它的 res/）；
+      # ② 再用仓库里暂存的同一套产物（src-tauri/icons/android/，上次 tauri icon 的输出）覆盖一遍
+      #    —— 两步产的是同一个图标，② 是为了不依赖 CLI 的目录探测行为，确定性落位。
+      - name: Apply the unified app icon
+        run: |
+          set -euo pipefail
+          npx tauri icon src-tauri/icons/icon-master-1024.png
+          cp -R src-tauri/icons/android/. src-tauri/gen/android/app/src/main/res/
+          n=$(find src-tauri/gen/android/app/src/main/res -name 'ic_launcher*.png' | wc -l | tr -d ' ')
+          echo "res/ 里的启动图标 PNG：$n 个"
+          [ "$n" -ge 15 ] || { echo "::error::统一图标没落位（应至少 15 个 mipmap PNG）"; exit 1; }
+          echo "::notice title=安卓图标已统一::启动图标来自 src-tauri/icons/icon-master-1024.png（深靛蓝母版）"
+
+      - name: Use the NDK shipped with the runner
+        run: |
+          set -euo pipefail
+          SDK="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+          # 为什么不用 sdkmanager 装：ubuntu-latest 镜像**自带 NDK**（实测 29.0.14206865，
+          # `tauri android init` 自己就认出来了），而往 /usr/local/lib/android 写需要 sudo，
+          # 所以 `sdkmanager --install ndk;…` 一律失败（包括装已经存在的那个版本），还要白下 ~1GB。
+          NDK_DIR="$(find "$SDK/ndk" -maxdepth 1 -mindepth 1 -type d 2>/dev/null | sort -V | tail -1 || true)"
+          if [ -z "$NDK_DIR" ]; then
+            echo "::error::镜像里没有预装 NDK。改用 sudo sdkmanager --install \"ndk;<版本>\" 自己装一个（会下 ~1GB）"
+            exit 1
+          fi
+          NDK_VER="$(basename "$NDK_DIR")"
+          echo "NDK_HOME=$NDK_DIR" >> "$GITHUB_ENV"
+          echo "使用镜像自带的 NDK：$NDK_VER"
+
+          # 工程里没写 ndkVersion 时，AGP 会用它自己的默认版本（那个版本镜像里不一定有）。
+          # 这里在**生成物**里补一行，把版本钉到实际装着的这个 —— 改生成物不进仓库，也就不会污染版本库。
+          GP=src-tauri/gen/android/app/build.gradle.kts
+          if [ -f "$GP" ] && ! grep -q "ndkVersion" "$GP"; then
+            sed -i "0,/android {/s//android {\n    ndkVersion = \"$NDK_VER\"/" "$GP"
+            echo "已写入 ndkVersion = \"$NDK_VER\" → $GP"
+          fi
+
+      # 正式签名：没签名的 release APK 装不上（安装器报 packageInfo is null，v1.1.1/v1.1.2 就是这样）。
+      # 按 Tauri v2 官方文档（v2.tauri.app/distribute/sign/android/）：
+      # 写 keystore.properties + 在 build.gradle.kts 里加 signingConfigs —— gen/android 是 CI 现场生成的，
+      # 所以这两样都在 init 之后注入，改的是生成物、不进仓库。
+      - name: Set up release signing
+        env:
+          KEY_BASE64: ${{ secrets.ANDROID_KEY_BASE64 }}
+          KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+        run: |
+          set -euo pipefail
+          if [ -z "$KEY_BASE64" ] || [ -z "$KEY_PASSWORD" ] || [ -z "$KEY_ALIAS" ]; then
+            echo "::error title=缺签名凭据::需要 ANDROID_KEY_BASE64 / ANDROID_KEY_PASSWORD / ANDROID_KEY_ALIAS 三个 secrets"
+            exit 1
+          fi
+          base64 -d <<< "$KEY_BASE64" > "$RUNNER_TEMP/keystore.jks"
+          ls -l "$RUNNER_TEMP/keystore.jks"
+          # 值通过环境变量交给 gradle（build.gradle.kts 里用 System.getenv 读）——
+          # 不写 keystore.properties：上一版尝试 Properties 方案时，.kts 里
+          # `java.util.Properties` 直接 Unresolved reference（Gradle KTS 的隐式导入不含它），
+          # 而 System.getenv 在 .kts 里没有任何坑。
+          {
+            echo "KEYSTORE_PATH=$RUNNER_TEMP/keystore.jks"
+            echo "KEYSTORE_PASSWORD=$KEY_PASSWORD"
+            echo "KEY_ALIAS=$KEY_ALIAS"
+          } >> "$GITHUB_ENV"
+          # 官方文档要求在 app/build.gradle.kts 里加 signingConfigs 并在 release buildType 上引用。
+          # 追加到文件末尾而不是改模板内部：Gradle Kotlin DSL 里 android {} 可以多次调用、配置会合并；
+          # 只在 KEYSTORE_PATH 存在时才挂签名 —— 本地 Android Studio 打开生成工程时（没有这些 env）
+          # 保持默认行为，CI 里则一定有（上面已把缺 secrets 拦成红色）。
+          cat >> src-tauri/gen/android/app/build.gradle.kts <<'EOF'
+
+          // ---- release signing（CI 注入；凭据走环境变量，勿手改）----
+          android {
+              val ksPath = System.getenv("KEYSTORE_PATH")
+              if (ksPath != null) {
+                  signingConfigs {
+                      create("release") {
+                          storeFile = file(ksPath)
+                          storePassword = System.getenv("KEYSTORE_PASSWORD") ?: ""
+                          keyAlias = System.getenv("KEY_ALIAS") ?: ""
+                          keyPassword = System.getenv("KEYSTORE_PASSWORD") ?: ""
+                      }
+                  }
+                  buildTypes {
+                      getByName("release") {
+                          signingConfig = signingConfigs.getByName("release")
+                      }
+                  }
+              }
+          }
+          EOF
+          echo "签名配置已注入"
+
+      # APK 是给用户直接装的（debug 签名即可侧载）；它是这条腿的硬产出，失败就该让 job 红。
+      # 注意：这条依赖 package.json 里的 "tauri" 脚本 —— Tauri 的安卓 Gradle 插件在编译 Rust 那一步
+      # 是执行 `npm run tauri …`，手写脚手架（没这个脚本）会以 "npm error Missing script: tauri" 失败。
+      - name: Build APK
+        run: npx tauri android build --apk
+
+      # AAB 是上架 Google Play 用的，必须换成 release 签名才有意义（现在只有 debug keystore），
+      # 所以做成尽力而为：成了就一起发，失败不影响 APK 与整轮发布。
+      - name: Build AAB (best effort)
+        continue-on-error: true
+        run: npx tauri android build --aab
+
+      # Gradle 吐出来的文件名是 app-universal-release[-unsigned].apk / .aab —— 不带版本号，
+      # 而且和 AGP 的固定命名一模一样，用户没法分清 v1.1.1 和 v1.2.0（实测确实被当成"没版本号"）。
+      # 包**里面**的 versionName/versionCode 是对的（aapt2 实测 1.1.1 / 1001001，随 tauri.conf.json 走）。
+      # 所以在收集时把文件名带上版本：niuma_<版本>-universal.apk / .aab。
+      - name: Collect Android outputs (rename with version)
+        run: |
+          set -euo pipefail
+          V="${{ needs.version.outputs.version }}"
+          mkdir -p out
+          apk="$(find src-tauri/gen/android/app/build/outputs/apk -name '*.apk' | head -1)"
+          aab="$(find src-tauri/gen/android/app/build/outputs/bundle -name '*.aab' | head -1)"
+          [ -n "$apk" ] || { echo "::error::没找到 APK"; exit 1; }
+          cp "$apk" "out/niuma_${V}-universal.apk"
+          if [ -n "$aab" ]; then cp "$aab" "out/niuma_${V}-universal.aab"; else echo "::warning::这轮没有 AAB（尽力而为步骤未产出）"; fi
+          ls -lh out
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: android-${{ needs.version.outputs.version }}
+          path: out/*
+          if-no-files-found: error
+          overwrite: false
+
+  # ---------------------------------------------------------------- iOS（默认关闭）
+  #
+  # 为什么默认关：iOS 要产出**可安装**的 ipa，必须有 Apple 开发者证书 + 描述文件
+  # （没有证书时 xcodebuild 的导出步骤一定失败；免费 Apple ID 只能 7 天侧载，不适合放 CI）。
+  # 打开方式：仓库 Settings → Variables 加 IOS_SIGNING = true，并配好三个 secrets：
+  #   IOS_CERT_P12_BASE64   —— 导出的 .p12 证书，base64 后的内容
+  #   IOS_CERT_PASSWORD     —— 导出 .p12 时设的密码
+  #   IOS_PROFILE_BASE64    —— .mobileprovision 描述文件，base64 后的内容
+  # 未打开时这个 job 直接跳过（不会让整轮发布变红）。
+  ios:
+    name: iOS IPA
+    needs: version
+    if: vars.IOS_SIGNING == 'true'
+    runs-on: macos-14
+    timeout-minutes: 90
+    steps:
+      # 源码在**私有仓** SvenVincent/niuma，这里用只读 deploy key 拉下来，落进工作区根目录 ——
+      # 所以后面所有相对路径（npm ci、.github/scripts/…、src-tauri/）一个字都不用改。
+      - uses: actions/checkout@v4
+        with:
+          repository: SvenVincent/niuma
+          ref: ${{ inputs.source_ref || github.ref_name }}
+          ssh-key: ${{ secrets.SRC_DEPLOY_KEY }}
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios,x86_64-apple-ios,aarch64-apple-ios-sim
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+          key: ios
+
+      - name: Import signing certificate & profile
+        env:
+          CERT_P12: ${{ secrets.IOS_CERT_P12_BASE64 }}
+          CERT_PWD: ${{ secrets.IOS_CERT_PASSWORD }}
+          PROFILE: ${{ secrets.IOS_PROFILE_BASE64 }}
+        run: |
+          set -euo pipefail
+          echo "$CERT_P12" | base64 --decode > /tmp/cert.p12
+          security create-keychain -p actions build.keychain
+          security default-keychain -s build.keychain
+          security unlock-keychain -p actions build.keychain
+          security import /tmp/cert.p12 -k build.keychain -P "$CERT_PWD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple: -s -k actions build.keychain
+          mkdir -p ~/Library/MobileDevice/Provisioning\ Profiles
+          echo "$PROFILE" | base64 --decode > ~/Library/MobileDevice/Provisioning\ Profiles/profile.mobileprovision
+
+      - run: npm ci
+
+      - name: Inject version
+        run: bash .github/scripts/inject-version.sh "${{ needs.version.outputs.version }}"
+
+      # 与安卓同理：gen/apple 由 `tauri ios init` 生成，仓库里没有就现场生成
+      # （runner 镜像自带 Xcode 与 CocoaPods，这两个是 init/build 的前置）
+      - name: Init iOS target if missing
+        run: |
+          set -euo pipefail
+          if [ -d src-tauri/gen/apple ]; then
+            echo "已存在 src-tauri/gen/apple，跳过 init"
+          else
+            npx tauri ios init --ci
+          fi
+
+      # 与安卓同理：现场生成的工程是模板默认图标，init 之后用母版重新生成
+      - name: Apply the unified app icon
+        run: npx tauri icon src-tauri/icons/icon-master-1024.png
+
+      - name: Build IPA
+        # debugging = 开发签名（装到自己的设备/TestFlight 前用）；
+        # 要发 App Store 换成 release-testing 或 app-store-connect
+        run: npx tauri ios build --export-method debugging
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ios-${{ needs.version.outputs.version }}
+          # 产物目录随 tauri/xcode 版本略有差异，用 glob 覆盖
+          path: |
+            src-tauri/gen/apple/build/**/*.ipa
+            src-tauri/gen/apple/build/*.ipa
+          if-no-files-found: error
+          overwrite: false
+
+  # ---------------------------------------------------------------- 汇总发布
+  release:
+    name: Publish GitHub Release
+    needs: [version, web, desktop, android, ios]
+    # 只在 tag 上发版；用 always() 是因为某个平台失败时也要把已有的产物发出去（缺失会在下面被点名）
+    if: always() && needs.version.result == 'success' && startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      # 缺平台要在日志/注解里说出来，不能让"少了一个平台的 Release"看起来是完整的
+      - name: Inventory artifacts
+        run: |
+          set -euo pipefail
+          # shellcheck disable=SC2012  # 这里只是给人看的清单，文件名固定
+          ls -lh artifacts
+          for pat in "*.dmg" "*.exe" "*.AppImage" "*.deb" "*.apk" "*.aab" "*.ipa" "*.zip"; do
+            n=$(find artifacts -name "$pat" | wc -l | tr -d ' ')
+            if [ "$n" -gt 0 ]; then
+              echo "✓ $pat × $n"
+            else
+              echo "::warning title=这次没有 $pat::对应平台的构建可能失败了，看上面各 job 的结论"
+            fi
+          done
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            artifacts/**/*.dmg
+            artifacts/**/*.exe
+            artifacts/**/*.AppImage
+            artifacts/**/*.deb
+            artifacts/**/*.apk
+            artifacts/**/*.aab
+            artifacts/**/*.ipa
+            artifacts/**/*.zip
+          generate_release_notes: true
+          # v1.1.0-rc1 这类自动标成预发布
+          prerelease: ${{ contains(github.ref_name, '-') }}
+
+  # ---------------------------------------------------------------- 官网安装包（可选）
+  # 打开方式：Settings → Variables 里加 PUBLISH_R2 = true，并配好上面列的 R2 secrets。
+  # 发布脚本按扩展名认平台，会自动刷新官网 /download 的清单（安卓/Windows/macOS 会带正确图标）。
+  publish-download:
+    name: Publish installers to /download
+    needs: [version, desktop, android]
+    if: always() && vars.PUBLISH_R2 == 'true' && startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      # 源码在**私有仓** SvenVincent/niuma，这里用只读 deploy key 拉下来，落进工作区根目录 ——
+      # 所以后面所有相对路径（npm ci、.github/scripts/…、src-tauri/）一个字都不用改。
+      - uses: actions/checkout@v4
+        with:
+          repository: SvenVincent/niuma
+          ref: ${{ inputs.source_ref || github.ref_name }}
+          ssh-key: ${{ secrets.SRC_DEPLOY_KEY }}
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+      - uses: actions/download-artifact@v4
+        with:
+          path: out
+          merge-multiple: true
+      - run: npm ci
+      - name: Upload to R2
+        env:
+          CF_R2_ACCOUNT_ID: ${{ secrets.CF_R2_ACCOUNT_ID }}
+          CF_R2_ACCESS_KEY_ID: ${{ secrets.CF_R2_ACCESS_KEY_ID }}
+          CF_R2_SECRET_ACCESS_KEY: ${{ secrets.CF_R2_SECRET_ACCESS_KEY }}
+          CF_R2_BUCKET_NAME: ${{ secrets.CF_R2_BUCKET_NAME }}
+          CF_R2_ENDPOINT: ${{ secrets.CF_R2_ENDPOINT }}
+        run: |
+          set -euo pipefail
+          # 只推官网下载页认得的安装包。注意深度：desktop 的产物在 artifact 里带着
+          # release/bundle/<平台>/ 前缀（合并下载后在 out/release/bundle/...，第 4~5 层），
+          # 之前写 -maxdepth 2 正好把 dmg/exe 全漏掉、只传上了 APK（v1.1.2 首跑实测）。
+          # AAB 不上下载页：普通用户装不了 AAB（那是上架 Play 用的），它只留在 GitHub Release。
+          files=$(find out -maxdepth 6 \( -name '*.apk' -o -name '*.dmg' -o -name '*.exe' -o -name '*.msi' \) | sort)
+          [ -n "$files" ] || { echo "::error::没找到可发布的安装包"; exit 1; }
+          echo "$files"
+          # 故意不加引号：$files 是多行文件名列表，要按空白拆成多个参数
+          # shellcheck disable=SC2086
+          node scripts/publish-release.mjs $files
+
+  # ---------------------------------------------------------------- 网页版部署（可选）
+  # 打开方式：Settings → Variables 里加 DEPLOY_WEB = true，并配 CLOUDFLARE_API_TOKEN / CLOUDFLARE_ACCOUNT_ID。
+  # 用 web job 已经构好的产物，不重复构建（同一个 Worker 同时发前端与 /api/*，只能走 wrangler deploy）。
+  deploy-web:
+    name: Deploy web to Cloudflare
+    needs: [version, web]
+    if: vars.DEPLOY_WEB == 'true' && startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      # 源码在**私有仓** SvenVincent/niuma，这里用只读 deploy key 拉下来，落进工作区根目录 ——
+      # 所以后面所有相对路径（npm ci、.github/scripts/…、src-tauri/）一个字都不用改。
+      - uses: actions/checkout@v4
+        with:
+          repository: SvenVincent/niuma
+          ref: ${{ inputs.source_ref || github.ref_name }}
+          ssh-key: ${{ secrets.SRC_DEPLOY_KEY }}
+          fetch-depth: 0
+      - uses: actions/download-artifact@v4
+        with:
+          name: web-${{ needs.version.outputs.version }}
+          path: web
+      - name: Unpack dist
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          unzip -oq web/*.zip -d dist
+          # shellcheck disable=SC2012  # 只是打印前几个文件名给人看
+          ls dist | head
+      - uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          workingDirectory: cloudflare/worker
+          wranglerVersion: "4"
+          command: deploy
