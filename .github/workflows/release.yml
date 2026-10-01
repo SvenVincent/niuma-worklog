@@ -603,9 +603,11 @@ jobs:
           set -euo pipefail
           # 只推官网下载页认得的安装包。注意深度：desktop 的产物在 artifact 里带着
           # release/bundle/<平台>/ 前缀（合并下载后在 out/release/bundle/...，第 4~5 层），
-          # 之前写 -maxdepth 2 正好把 dmg/exe 全漏掉、只传上了 APK（v1.1.2 首跑实测）。
+          # 之前写 -maxdepth 2 正好把 dmg/exe 全漏掉、只传上了 APK（v1.1.2 首跑实测）；
+          # 后来又漏了 AppImage/deb —— 扩展名列表和 publish-release.mjs 的 KINDS 是两份，
+          # 加扩展名时**三处都要动**：这里、scripts/publish-release.mjs、Worker 的 RELEASE_KINDS。
           # AAB 不上下载页：普通用户装不了 AAB（那是上架 Play 用的），它只留在 GitHub Release。
-          files=$(find out -maxdepth 6 \( -name '*.apk' -o -name '*.dmg' -o -name '*.exe' -o -name '*.msi' \) | sort)
+          files=$(find out -maxdepth 6 \( -iname '*.apk' -o -iname '*.dmg' -o -iname '*.exe' -o -iname '*.msi' -o -iname '*.appimage' -o -iname '*.deb' \) | sort)
           [ -n "$files" ] || { echo "::error::没找到可发布的安装包"; exit 1; }
           echo "$files"
           # 故意不加引号：$files 是多行文件名列表，要按空白拆成多个参数
