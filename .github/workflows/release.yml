@@ -129,11 +129,11 @@ jobs:
       - name: Package dist
         run: |
           set -euo pipefail
-          cd dist && zip -qr "../niuma-web-${{ needs.version.outputs.version }}.zip" .
+          cd dist && zip -qr "../WorkLog-web-${{ needs.version.outputs.version }}.zip" .
       - uses: actions/upload-artifact@v4
         with:
           name: web-${{ needs.version.outputs.version }}
-          path: niuma-web-${{ needs.version.outputs.version }}.zip
+          path: WorkLog-web-${{ needs.version.outputs.version }}.zip
           if-no-files-found: error
           overwrite: false
 
@@ -414,7 +414,7 @@ jobs:
       # Gradle 吐出来的文件名是 app-universal-release[-unsigned].apk / .aab —— 不带版本号，
       # 而且和 AGP 的固定命名一模一样，用户没法分清 v1.1.1 和 v1.2.0（实测确实被当成"没版本号"）。
       # 包**里面**的 versionName/versionCode 是对的（aapt2 实测 1.1.1 / 1001001，随 tauri.conf.json 走）。
-      # 所以在收集时把文件名带上版本：niuma_<版本>-universal.apk / .aab。
+      # 所以在收集时把文件名带上版本：WorkLog_<版本>-universal.apk / .aab（与桌面产物的 WorkLog_ 前缀一致）。
       - name: Collect Android outputs (rename with version)
         run: |
           set -euo pipefail
@@ -423,8 +423,8 @@ jobs:
           apk="$(find src-tauri/gen/android/app/build/outputs/apk -name '*.apk' | head -1)"
           aab="$(find src-tauri/gen/android/app/build/outputs/bundle -name '*.aab' | head -1)"
           [ -n "$apk" ] || { echo "::error::没找到 APK"; exit 1; }
-          cp "$apk" "out/niuma_${V}-universal.apk"
-          if [ -n "$aab" ]; then cp "$aab" "out/niuma_${V}-universal.aab"; else echo "::warning::这轮没有 AAB（尽力而为步骤未产出）"; fi
+          cp "$apk" "out/WorkLog_${V}-universal.apk"
+          if [ -n "$aab" ]; then cp "$aab" "out/WorkLog_${V}-universal.aab"; else echo "::warning::这轮没有 AAB（尽力而为步骤未产出）"; fi
           ls -lh out
 
       - uses: actions/upload-artifact@v4
