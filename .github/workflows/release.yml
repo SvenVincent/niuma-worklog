@@ -305,18 +305,21 @@ jobs:
           grep -rhn "ndkVersion" src-tauri/gen/android --include="*.kts" --include="*.gradle" || echo "（工程里没写 ndkVersion）"
 
       # 统一图标：gen/android 是现场生成的，init 给的是 Tauri 模板默认图标。
-      # ① tauri icon 从 1024 母版重新生成全套（gen/android 存在时会写进它的 res/）；
+      # ① tauri icon 走 src-tauri/icons/icon-manifest.json 重新生成全套（gen/android 存在时会直接
+      #    写进它的 res/）。必须带 manifest：android_fg 是「母版缩到 70% 居中留白」的前景源，
+      #    bg_color 是遮罩外露出的 #282570 —— 直接传母版会把自适应前景铺满 108dp 画布，
+      #    启动器 72dp 遮罩一裁，书本顶满图标、深靛蓝底消失（v1.1.8 图标发白发糊的根因）；
       # ② 再用仓库里暂存的同一套产物（src-tauri/icons/android/，上次 tauri icon 的输出）覆盖一遍
       #    —— 两步产的是同一个图标，② 是为了不依赖 CLI 的目录探测行为，确定性落位。
       - name: Apply the unified app icon
         run: |
           set -euo pipefail
-          npx tauri icon src-tauri/icons/icon-master-1024.png
+          npx tauri icon src-tauri/icons/icon-manifest.json
           cp -R src-tauri/icons/android/. src-tauri/gen/android/app/src/main/res/
           n=$(find src-tauri/gen/android/app/src/main/res -name 'ic_launcher*.png' | wc -l | tr -d ' ')
           echo "res/ 里的启动图标 PNG：$n 个"
           [ "$n" -ge 15 ] || { echo "::error::统一图标没落位（应至少 15 个 mipmap PNG）"; exit 1; }
-          echo "::notice title=安卓图标已统一::启动图标来自 src-tauri/icons/icon-master-1024.png（深靛蓝母版）"
+          echo "::notice title=安卓图标已统一::启动图标来自 icon-manifest.json（深靛蓝母版 + 70% 安全区留白前景）"
 
       - name: Use the NDK shipped with the runner
         run: |
