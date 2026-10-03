@@ -524,6 +524,27 @@ jobs:
           if-no-files-found: error
           overwrite: false
 
+
+  # ios:
+  #   name: iOS Compile
+  #   runs-on: macos-14
+  #   steps:
+  #     - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+
+  #     - name: Set up Flutter
+  #       uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2
+  #       with:
+  #         channel: stable
+  #         flutter-version-file: .fvmrc
+  #         cache: true
+
+  #     - name: Flutter pub get
+  #       run: flutter pub get
+
+  #     - name: Compile unsigned iOS release
+  #       run: flutter build ios --release --no-codesign
+
+        
   # ---------------------------------------------------------------- 汇总发布
   release:
     name: Publish GitHub Release
